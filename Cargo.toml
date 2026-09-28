@@ -1,0 +1,14 @@
+[package]
+name = "woonsocket"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+woonsocket-work = { git = "https://github.com/cs1675/woonsocket-work", features = ["argparse"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+
+[[bin]]
+name = "server"
+path = "src/bin/server.rs"
