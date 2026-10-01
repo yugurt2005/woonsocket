@@ -1,87 +1,90 @@
 use crate::clock::now_ns;
-use crate::proto::{Request, Response};
+use crate::proto::{Request, Response, recv, send};
 use std::cell::Cell;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter};
 use std::net::{TcpListener, TcpStream};
-use std::panic;
-use std::thread;
+use std::sync::mpsc;
 use std::time::Duration;
+use std::{panic, process, thread};
 use woonsocket_work::Work;
-use woonsocket_work::args::WoonsocketServerOpt;
 
-pub fn run(opt: WoonsocketServerOpt) -> std::io::Result<()> {
-    let listener = TcpListener::bind(("0.0.0.0", opt.port))?;
-    thread::spawn(move || serve(listener));
-    // Blocking accept/read can't observe a deadline, and the server has nothing to flush.
-    thread::sleep(Duration::from_secs(opt.runtime_secs));
-    std::process::exit(0);
-}
-
-/// Accept connections forever, one thread per connection.
-pub fn serve(listener: TcpListener) {
+pub fn run(port: u16, runtime: Duration) -> io::Result<()> {
+    let listener = TcpListener::bind(("0.0.0.0", port))?;
     silence_perform_panics();
-    for stream in listener.incoming() {
-        match stream {
-            Ok(s) => {
-                thread::spawn(move || {
-                    if let Err(e) = handle_conn(s) {
-                        eprintln!("connection closed: {e}");
-                    }
-                });
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            if let Err(e) = stream.and_then(handle_connection) {
+                eprintln!("Failed to accept connection: {e}");
             }
-            Err(e) => eprintln!("accept failed: {e}"),
         }
-    }
+    });
+    // Blocking accepts and reads can't observe a deadline, and there is nothing to flush.
+    thread::sleep(runtime);
+    process::exit(0)
 }
 
-fn handle_conn(stream: TcpStream) -> bincode::Result<()> {
+/// A reader drains requests off the socket as fast as they arrive, so overload queues up here
+/// rather than pushing back on the client; a worker serves the queue in order.
+fn handle_connection(stream: TcpStream) -> io::Result<()> {
     stream.set_nodelay(true)?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = BufWriter::new(stream);
-    while let Some(req) = recv(&mut reader)? {
-        let server_recv_ns = now_ns();
-        let payload = perform(req.work);
-        let resp = Response {
-            id: req.id,
-            server_recv_ns,
-            server_sent_ns: now_ns(),
-            payload,
-        };
-        bincode::serialize_into(&mut writer, &resp)?;
-        writer.flush()?; // one write() per response
-    }
-    Ok(())
-}
+    let (queue, requests) = mpsc::channel();
 
-/// Read one request; `Ok(None)` if the client closed the connection cleanly.
-fn recv(r: &mut impl Read) -> bincode::Result<Option<Request>> {
-    match bincode::deserialize_from(r) {
-        Ok(req) => Ok(Some(req)),
-        Err(e) => match *e {
-            bincode::ErrorKind::Io(ref io) if io.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
-            _ => Err(e),
-        },
-    }
+    thread::spawn(move || {
+        loop {
+            let request = match recv::<Request>(&mut reader) {
+                Ok(Some(request)) => request,
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("Failed to receive message: {e}");
+                    break;
+                }
+            };
+            if queue.send((request, now_ns())).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Ends once the reader is done and the queue is drained; dropping the writer then closes
+    // the connection, which tells the client every response has been sent.
+    thread::spawn(move || {
+        for (request, server_recv_ns) in requests {
+            let payload = perform(request.work);
+            let response = Response {
+                id: request.id,
+                server_recv_ns,
+                server_sent_ns: now_ns(),
+                payload,
+            };
+            if let Err(e) = send(&mut writer, &response) {
+                eprintln!("Failed to send message: {e}");
+                break;
+            }
+        }
+    });
+    Ok(())
 }
 
 thread_local! {
     static IN_PERFORM: Cell<bool> = const { Cell::new(false) };
 }
 
-/// `Work::Poisson` panics when its draw is 0; that draw means no work, so treat it as such.
+/// `Work::Poisson` panics when it draws 0; that draw means no work, so treat it as such.
 fn perform(work: Work) -> Vec<u8> {
     IN_PERFORM.set(true);
-    let out = panic::catch_unwind(move || work.perform());
+    let result = panic::catch_unwind(|| work.perform());
     IN_PERFORM.set(false);
-    out.ok().flatten().unwrap_or_default()
+    result.ok().flatten().unwrap_or_default()
 }
 
-/// Suppress the panic message for panics caught in `perform`, keeping it for everything else.
+/// Hides the message for panics caught in `perform`; every other panic still reports.
 fn silence_perform_panics() {
-    let default = panic::take_hook();
+    let default_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
         if !IN_PERFORM.get() {
-            default(info);
+            default_hook(info);
         }
     }));
 }

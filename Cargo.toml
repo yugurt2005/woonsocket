@@ -7,8 +7,8 @@ edition = "2024"
 woonsocket-work = { git = "https://github.com/cs1675/woonsocket-work", features = ["argparse"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 bincode = "1.3"
+rand = "0.8"
+rand_distr = "0.4"
 
-[[bin]]
-name = "server"
-path = "src/bin/server.rs"
